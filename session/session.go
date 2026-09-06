@@ -21,6 +21,7 @@
 package session
 
 import (
+	"context"
 	"errors"
 	"net"
 	"sync"
@@ -51,6 +52,13 @@ var (
 // Session instance related to the client will be passed to Handler method as the first
 // parameter.
 type Session struct {
+	*sessionState
+	requestMID   uint64
+	requestBound bool
+	ctx          context.Context
+}
+
+type sessionState struct {
 	sync.RWMutex                        // protect data
 	id           int64                  // session global unique id
 	uid          int64                  // binding user id
@@ -58,18 +66,47 @@ type Session struct {
 	entity       NetworkEntity          // low-level network entity
 	data         map[string]interface{} // session data store
 	router       *Router
+	lifetime     context.Context
 }
 
 // New returns a new session instance
 // a NetworkEntity is a low-level network instance
 func New(entity NetworkEntity) *Session {
-	return &Session{
-		id:       service.Connections.SessionID(),
-		entity:   entity,
-		data:     make(map[string]interface{}),
-		lastTime: time.Now().Unix(),
-		router:   newRouter(),
+	return NewWithContext(context.Background(), entity)
+}
+
+// NewWithContext creates a session whose operations use the connection context.
+func NewWithContext(ctx context.Context, entity NetworkEntity) *Session {
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	return &Session{ctx: ctx, sessionState: &sessionState{
+		id: service.Connections.SessionID(), entity: entity,
+		data: make(map[string]interface{}), lastTime: time.Now().Unix(),
+		router: newRouter(), lifetime: ctx,
+	}}
+}
+
+// WithRequest binds the response ID and context without copying session state
+// or its mutex. Keep this view when responding from an asynchronous callback.
+func (s *Session) WithRequest(ctx context.Context, mid uint64) *Session {
+	if ctx == nil {
+		ctx = s.Context()
+	}
+	return &Session{sessionState: s.sessionState, ctx: ctx, requestMID: mid, requestBound: true}
+}
+
+// Context returns the request or connection context.
+func (s *Session) Context() context.Context {
+	if s.ctx == nil {
+		return context.Background()
+	}
+	return s.ctx
+}
+
+// Connection returns an unbound view suitable for long-lived session storage.
+func (s *Session) Connection() *Session {
+	return &Session{sessionState: s.sessionState, ctx: s.sessionState.lifetime}
 }
 
 // NetworkEntity returns the low-level network agent object
@@ -84,22 +121,68 @@ func (s *Session) Router() *Router {
 
 // RPC sends message to remote server
 func (s *Session) RPC(route string, v interface{}) error {
+	return s.RPCContext(s.Context(), route, v)
+}
+
+// RPCContext propagates cancellation to context-aware network entities.
+func (s *Session) RPCContext(ctx context.Context, route string, v interface{}) error {
+	if ctx == nil {
+		ctx = s.Context()
+	}
+	if entity, ok := s.entity.(interface {
+		RPCContext(context.Context, string, interface{}) error
+	}); ok {
+		return entity.RPCContext(ctx, route, v)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return s.entity.RPC(route, v)
 }
 
 // Push message to client
 func (s *Session) Push(route string, v interface{}) error {
+	return s.PushContext(s.sessionState.lifetime, route, v)
+}
+
+// PushContext applies an explicit deadline to a connection push.
+func (s *Session) PushContext(ctx context.Context, route string, v interface{}) error {
+	if ctx == nil {
+		ctx = s.sessionState.lifetime
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if entity, ok := s.entity.(interface {
+		PushContext(context.Context, string, interface{}) error
+	}); ok {
+		return entity.PushContext(ctx, route, v)
+	}
 	return s.entity.Push(route, v)
 }
 
 // Response message to client
 func (s *Session) Response(v interface{}) error {
-	return s.entity.Response(v)
+	if !s.requestBound {
+		if err := s.Context().Err(); err != nil {
+			return err
+		}
+		return s.entity.Response(v)
+	}
+	return s.ResponseMID(s.requestMID, v)
 }
 
 // ResponseMID responses message to client, mid is
 // request message ID
 func (s *Session) ResponseMID(mid uint64, v interface{}) error {
+	if err := s.Context().Err(); err != nil {
+		return err
+	}
+	if entity, ok := s.entity.(interface {
+		ResponseMidContext(context.Context, uint64, interface{}) error
+	}); ok {
+		return entity.ResponseMidContext(s.Context(), mid, v)
+	}
 	return s.entity.ResponseMid(mid, v)
 }
 
@@ -115,6 +198,9 @@ func (s *Session) UID() int64 {
 
 // LastMid returns the last message id
 func (s *Session) LastMid() uint64 {
+	if s.requestBound {
+		return s.requestMID
+	}
 	return s.entity.LastMid()
 }
 
@@ -393,12 +479,16 @@ func (s *Session) Value(key string) interface{} {
 	return s.data[key]
 }
 
-// State returns all session state
+// State returns a shallow snapshot. Values themselves remain caller-owned.
 func (s *Session) State() map[string]interface{} {
 	s.RLock()
 	defer s.RUnlock()
 
-	return s.data
+	snapshot := make(map[string]interface{}, len(s.data))
+	for key, value := range s.data {
+		snapshot[key] = value
+	}
+	return snapshot
 }
 
 // Restore session state after reconnect
@@ -406,7 +496,10 @@ func (s *Session) Restore(data map[string]interface{}) {
 	s.Lock()
 	defer s.Unlock()
 
-	s.data = data
+	s.data = make(map[string]interface{}, len(data))
+	for key, value := range data {
+		s.data[key] = value
+	}
 }
 
 // Clear releases all data related to current session
@@ -414,6 +507,6 @@ func (s *Session) Clear() {
 	s.Lock()
 	defer s.Unlock()
 
-	s.uid = 0
+	atomic.StoreInt64(&s.uid, 0)
 	s.data = map[string]interface{}{}
 }

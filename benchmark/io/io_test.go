@@ -1,4 +1,4 @@
-// +build benchmark
+//go:build benchmark
 
 package io
 
@@ -96,8 +96,9 @@ func TestIO(t *testing.T) {
 
 	log.SetFlags(log.LstdFlags | log.Llongfile)
 
-	sg := make(chan os.Signal)
+	sg := make(chan os.Signal, 1)
 	signal.Notify(sg, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGKILL)
+	defer signal.Stop(sg)
 
 	<-sg
 

@@ -23,121 +23,134 @@ package cluster
 import (
 	"context"
 	"errors"
+	"github.com/lonng/nano/internal/env"
+	"google.golang.org/grpc"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/lonng/nano/internal/env"
-	"google.golang.org/grpc"
 )
 
-type connPool struct {
-	index uint32
-	v     []*grpc.ClientConn
-}
+var errRPCClientClosed = errors.New("rpc client is closed")
 
+type connPool struct {
+	once  sync.Once
+	index uint32
+	v     []*grpc.ClientConn // Immutable after publication, including during Close.
+}
+type pendingPool struct {
+	ready chan struct{}
+	pool  *connPool
+	err   error
+}
 type rpcClient struct {
 	sync.RWMutex
 	isClosed bool
 	pools    map[string]*connPool
+	creating map[string]*pendingPool
+	ctx      context.Context
+	cancel   context.CancelFunc
 }
 
 func newConnArray(maxSize uint, addr string) (*connPool, error) {
-	a := &connPool{
-		index: 0,
-		v:     make([]*grpc.ClientConn, maxSize),
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return newConnArrayContext(ctx, maxSize, addr)
+}
+func newConnArrayContext(ctx context.Context, maxSize uint, addr string) (*connPool, error) {
+	if maxSize == 0 {
+		return nil, errors.New("empty connection pool")
 	}
-	if err := a.init(addr); err != nil {
-		return nil, err
+	a := &connPool{v: make([]*grpc.ClientConn, maxSize)}
+	for i := range a.v {
+		conn, err := grpc.DialContext(ctx, addr, env.GrpcOptions...)
+		if err != nil {
+			a.Close()
+			return nil, err
+		}
+		a.v[i] = conn
 	}
 	return a, nil
 }
-
-func (a *connPool) init(addr string) error {
-	for i := range a.v {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		conn, err := grpc.DialContext(
-			ctx,
-			addr,
-			env.GrpcOptions...,
-		)
-		cancel()
-		if err != nil {
-			// Cleanup if the initialization fails.
-			a.Close()
-			return err
-		}
-		a.v[i] = conn
-
-	}
-	return nil
-}
-
 func (a *connPool) Get() *grpc.ClientConn {
-	next := atomic.AddUint32(&a.index, 1) % uint32(len(a.v))
-	return a.v[next]
+	return a.v[atomic.AddUint32(&a.index, 1)%uint32(len(a.v))]
 }
-
 func (a *connPool) Close() {
-	for i, c := range a.v {
-		if c != nil {
-			err := c.Close()
-			if err != nil {
-				// TODO: error handling
+	a.once.Do(func() {
+		for _, conn := range a.v {
+			if conn != nil {
+				conn.Close()
 			}
-			a.v[i] = nil
 		}
-	}
+	})
 }
-
 func newRPCClient() *rpcClient {
-	return &rpcClient{
-		pools: make(map[string]*connPool),
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &rpcClient{pools: make(map[string]*connPool), creating: make(map[string]*pendingPool), ctx: ctx, cancel: cancel}
 }
-
 func (c *rpcClient) getConnPool(addr string) (*connPool, error) {
-	c.RLock()
+	return c.getConnPoolContext(context.Background(), addr)
+}
+func (c *rpcClient) getConnPoolContext(ctx context.Context, addr string) (*connPool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	c.Lock()
 	if c.isClosed {
-		c.RUnlock()
-		return nil, errors.New("rpc client is closed")
+		c.Unlock()
+		return nil, errRPCClientClosed
 	}
-	array, ok := c.pools[addr]
-	c.RUnlock()
-	if !ok {
-		var err error
-		array, err = c.createConnPool(addr)
-		if err != nil {
-			return nil, err
+	if pool := c.pools[addr]; pool != nil {
+		c.Unlock()
+		return pool, nil
+	}
+	if pending := c.creating[addr]; pending != nil {
+		c.Unlock()
+		select {
+		case <-pending.ready:
+			return pending.pool, pending.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-c.ctx.Done():
+			return nil, errRPCClientClosed
 		}
 	}
-	return array, nil
-}
-
-func (c *rpcClient) createConnPool(addr string) (*connPool, error) {
-	c.Lock()
-	defer c.Unlock()
-	array, ok := c.pools[addr]
-	if !ok {
-		var err error
-		// TODO: make conn count configurable
-		array, err = newConnArray(10, addr)
-		if err != nil {
-			return nil, err
-		}
-		c.pools[addr] = array
-	}
-	return array, nil
-}
-
-func (c *rpcClient) closePool() {
-	c.Lock()
-	if !c.isClosed {
-		c.isClosed = true
-		// close all connections
-		for _, array := range c.pools {
-			array.Close()
-		}
-	}
+	pending := &pendingPool{ready: make(chan struct{})}
+	c.creating[addr] = pending
 	c.Unlock()
+	// Dial outside the registry lock; one creator per address, cancellable on close.
+	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	stop := context.AfterFunc(c.ctx, cancel)
+	pool, err := newConnArrayContext(dialCtx, 10, addr)
+	stop()
+	cancel()
+	c.Lock()
+	if c.isClosed {
+		err = errRPCClientClosed
+	}
+	if err == nil {
+		c.pools[addr] = pool
+	} else if pool != nil {
+		pool.Close()
+		pool = nil
+	}
+	pending.pool, pending.err = pool, err
+	delete(c.creating, addr)
+	close(pending.ready)
+	c.Unlock()
+	return pool, err
+}
+func (c *rpcClient) closePool() {
+	c.cancel()
+	c.Lock()
+	if c.isClosed {
+		c.Unlock()
+		return
+	}
+	c.isClosed = true
+	pools := c.pools
+	c.pools = make(map[string]*connPool)
+	c.Unlock()
+	for _, pool := range pools {
+		pool.Close()
+	}
 }

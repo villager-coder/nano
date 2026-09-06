@@ -39,8 +39,9 @@ var ErrPacketSizeExcced = errors.New("codec: packet size exceed")
 // A Decoder reads and decodes network data slice
 type Decoder struct {
 	buf  *bytes.Buffer
-	size int  // last packet length
-	typ  byte // last packet type
+	size int   // last packet length
+	typ  byte  // last packet type
+	err  error // terminal framing error
 }
 
 // NewDecoder returns a new decoder that used for decode network bytes slice.
@@ -67,8 +68,12 @@ func (c *Decoder) forward() error {
 }
 
 // Decode decode the network bytes slice to packet.Packet(s)
+// A framing error is terminal: subsequent calls return the same error.
 // TODO(Warning): shared slice
 func (c *Decoder) Decode(data []byte) ([]*packet.Packet, error) {
+	if c.err != nil {
+		return nil, c.err
+	}
 	c.buf.Write(data)
 
 	var (
@@ -76,13 +81,14 @@ func (c *Decoder) Decode(data []byte) ([]*packet.Packet, error) {
 		err     error
 	)
 	// check length
-	if c.buf.Len() < HeadLength {
+	if c.size < 0 && c.buf.Len() < HeadLength {
 		return nil, err
 	}
 
 	// first time
 	if c.size < 0 {
 		if err = c.forward(); err != nil {
+			c.err = err
 			return nil, err
 		}
 	}
@@ -98,6 +104,7 @@ func (c *Decoder) Decode(data []byte) ([]*packet.Packet, error) {
 		}
 
 		if err = c.forward(); err != nil {
+			c.err = err
 			return packets, err
 		}
 	}
@@ -114,6 +121,9 @@ func (c *Decoder) Decode(data []byte) ([]*packet.Packet, error) {
 func Encode(typ packet.Type, data []byte) ([]byte, error) {
 	if typ < packet.Handshake || typ > packet.Kick {
 		return nil, packet.ErrWrongPacketType
+	}
+	if len(data) > MaxPacketSize {
+		return nil, ErrPacketSizeExcced
 	}
 
 	p := &packet.Packet{Type: typ, Length: len(data)}

@@ -21,36 +21,43 @@
 package scheduler
 
 import (
+	"errors"
 	"fmt"
 	"runtime/debug"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/lonng/nano/internal/env"
 	"github.com/lonng/nano/internal/log"
 )
 
-const (
-	messageQueueBacklog = 1 << 10
-	sessionCloseBacklog = 1 << 8
-)
-
-// LocalScheduler schedules task to a customized goroutine
-type LocalScheduler interface {
-	Schedule(Task)
-}
-
+type LocalScheduler interface{ Schedule(Task) }
 type Task func()
-
 type Hook func()
 
 var (
-	chDie   = make(chan struct{})
-	chExit  = make(chan struct{})
-	chTasks = make(chan Task, 1<<8)
-	started int32
-	closed  int32
+	ErrQueueFull = errors.New("scheduler queue full")
+	ErrClosed    = errors.New("scheduler closed")
+	ErrNilTask   = errors.New("nil scheduler task")
+	global       = newScheduler(256)
 )
+
+// scheduler owns both business tasks and connection finalizers. Finalizers have
+// a separate queue so overload cannot block socket cleanup or lose close hooks.
+type scheduler struct {
+	mu              sync.Mutex
+	tasks           chan Task
+	finalizers      []Task
+	wake            chan struct{}
+	stop            chan struct{}
+	done            chan struct{}
+	started, closed bool
+}
+
+func newScheduler(capacity int) *scheduler {
+	return &scheduler{tasks: make(chan Task, capacity), wake: make(chan struct{}, 1),
+		stop: make(chan struct{}), done: make(chan struct{})}
+}
 
 func try(f func()) {
 	defer func() {
@@ -61,40 +68,107 @@ func try(f func()) {
 	f()
 }
 
-func Sched() {
-	if atomic.AddInt32(&started, 1) != 1 {
-		return
+func (s *scheduler) push(task Task, finalizer bool) error {
+	if task == nil {
+		return ErrNilTask
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrClosed
+	}
+	if finalizer {
+		s.finalizers = append(s.finalizers, task)
+		select {
+		case s.wake <- struct{}{}:
+		default:
+		}
+		return nil
+	}
+	select {
+	case s.tasks <- task:
+		return nil
+	default:
+		return ErrQueueFull
+	}
+}
 
-	ticker := time.NewTicker(env.TimerPrecision)
-	defer func() {
-		ticker.Stop()
-		close(chExit)
-	}()
+func (s *scheduler) finalize() {
+	s.mu.Lock()
+	tasks := s.finalizers
+	s.finalizers = nil
+	s.mu.Unlock()
+	for _, task := range tasks {
+		try(task)
+	}
+}
 
+func (s *scheduler) drain() {
 	for {
 		select {
-		case <-ticker.C:
-			cron()
-
-		case f := <-chTasks:
-			try(f)
-
-		case <-chDie:
+		case task := <-s.tasks:
+			try(task)
+		default:
+			s.finalize()
 			return
 		}
 	}
 }
 
-func Close() {
-	if atomic.AddInt32(&closed, 1) != 1 {
+func (s *scheduler) run() {
+	s.mu.Lock()
+	if s.started || s.closed {
+		s.mu.Unlock()
 		return
 	}
-	close(chDie)
-	<-chExit
-	log.Println("Scheduler stopped")
+	s.started = true
+	s.mu.Unlock()
+	ticker := time.NewTicker(env.TimerPrecision)
+	defer ticker.Stop()
+	defer close(s.done)
+	for {
+		select {
+		case <-s.stop:
+			s.drain()
+			return
+		case <-ticker.C:
+			cron()
+		case task := <-s.tasks:
+			try(task)
+		case <-s.wake:
+			s.finalize()
+		}
+	}
 }
 
-func PushTask(task Task) {
-	chTasks <- task
+func (s *scheduler) close() {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		<-s.done
+		return
+	}
+	s.closed = true
+	close(s.stop)
+	started := s.started
+	s.mu.Unlock()
+	if !started {
+		s.drain()
+		close(s.done)
+	}
+	<-s.done
 }
+
+// Sched starts the process-wide logic scheduler. It may only run once.
+func Sched() { global.run() }
+
+// Close rejects new work, drains accepted tasks and finalizers, then waits for
+// the scheduler to exit. Call it outside a scheduler callback.
+func Close() { global.close() }
+
+// PushTask never blocks. Callers must handle ErrQueueFull and ErrClosed.
+func PushTask(task Task) error { return global.push(task, false) }
+
+// PushFinalizer queues a connection close hook on the logic goroutine without
+// consuming business queue capacity. Close drains accepted finalizers.
+func PushFinalizer(task Task) error { return global.push(task, true) }

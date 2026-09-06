@@ -175,3 +175,27 @@ func WithUnregisterCallback(fn func(member cluster.Member)) Option {
 		opt.UnregisterCallback = fn
 	}
 }
+
+// WithRPCTimeout sets the maximum duration of cluster RPCs (default 5 seconds).
+func WithRPCTimeout(timeout time.Duration) Option {
+	if timeout <= 0 {
+		panic("RPC timeout must be positive")
+	}
+	return func(opt *cluster.Options) { opt.RPCTimeout = timeout }
+}
+
+// WithWriteTimeout bounds each socket write (default 5 seconds).
+func WithWriteTimeout(timeout time.Duration) Option {
+	if timeout <= 0 {
+		panic("write timeout must be positive")
+	}
+	return func(opt *cluster.Options) { opt.WriteTimeout = timeout }
+}
+
+// WithShutdownTimeout bounds network and task waits during node shutdown.
+func WithShutdownTimeout(timeout time.Duration) Option {
+	if timeout <= 0 {
+		panic("shutdown timeout must be positive")
+	}
+	return func(opt *cluster.Options) { opt.ShutdownTimeout = timeout }
+}

@@ -29,8 +29,8 @@ import (
 )
 
 var (
-	typeOfError   = reflect.TypeOf((*error)(nil)).Elem()
-	typeOfBytes   = reflect.TypeOf(([]byte)(nil))
+	typeOfError   = reflect.TypeFor[error]()
+	typeOfBytes   = reflect.TypeFor[[]byte]()
 	typeOfSession = reflect.TypeOf(session.New(nil))
 )
 
@@ -40,7 +40,7 @@ func isExported(name string) bool {
 }
 
 func isExportedOrBuiltinType(t reflect.Type) bool {
-	for t.Kind() == reflect.Ptr {
+	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 	// PkgPath will be non-empty even for an exported type,
@@ -66,11 +66,11 @@ func isHandlerMethod(method reflect.Method) bool {
 		return false
 	}
 
-	if t1 := mt.In(1); t1.Kind() != reflect.Ptr || t1 != typeOfSession {
+	if t1 := mt.In(1); t1.Kind() != reflect.Pointer || t1 != typeOfSession {
 		return false
 	}
 
-	if (mt.In(2).Kind() != reflect.Ptr && mt.In(2) != typeOfBytes) || mt.Out(0) != typeOfError {
+	if (mt.In(2).Kind() != reflect.Pointer && mt.In(2) != typeOfBytes) || mt.Out(0) != typeOfError {
 		return false
 	}
 	return true

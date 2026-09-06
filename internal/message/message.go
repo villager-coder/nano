@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/lonng/nano/internal/log"
 )
@@ -59,8 +60,9 @@ func (t Type) String() string {
 }
 
 var (
-	routes = make(map[string]uint16) // route map to code
-	codes  = make(map[uint16]string) // code map to route
+	dictionaryMu sync.RWMutex
+	routes       = make(map[string]uint16) // route map to code
+	codes        = make(map[uint16]string) // code map to route
 )
 
 // Errors that could be occurred in message codec
@@ -125,25 +127,19 @@ func Encode(m *Message) ([]byte, error) {
 	buf := make([]byte, 0)
 	flag := byte(m.Type) << 1
 
+	dictionaryMu.RLock()
 	code, compressed := routes[m.Route]
+	dictionaryMu.RUnlock()
+	if routable(m.Type) && !compressed && len(m.Route) > msgRouteLengthMask {
+		return nil, ErrWrongMessage
+	}
 	if compressed {
 		flag |= msgRouteCompressMask
 	}
 	buf = append(buf, flag)
 
 	if m.Type == Request || m.Type == Response {
-		n := m.ID
-		// variant length encode
-		for {
-			b := byte(n % 128)
-			n >>= 7
-			if n != 0 {
-				buf = append(buf, b+128)
-			} else {
-				buf = append(buf, b)
-				break
-			}
-		}
+		buf = binary.AppendUvarint(buf, m.ID)
 	}
 
 	if routable(m.Type) {
@@ -176,30 +172,27 @@ func Decode(data []byte) (*Message, error) {
 	}
 
 	if m.Type == Request || m.Type == Response {
-		id := uint64(0)
-		// little end byte order
-		// WARNING: must can be stored in 64 bits integer
-		// variant length encode
-		for i := offset; i < len(data); i++ {
-			b := data[i]
-			id += uint64(b&0x7F) << uint64(7*(i-offset))
-			if b < 128 {
-				offset = i + 1
-				break
-			}
+		id, n := binary.Uvarint(data[offset:])
+		if n <= 0 {
+			return nil, ErrWrongMessage
 		}
 		m.ID = id
-	}
-
-	if offset >= len(data) {
-		return nil, ErrWrongMessage
+		offset += n
 	}
 
 	if routable(m.Type) {
+		if offset >= len(data) {
+			return nil, ErrWrongMessage
+		}
 		if flag&msgRouteCompressMask == 1 {
+			if len(data)-offset < 2 {
+				return nil, ErrWrongMessage
+			}
 			m.compressed = true
 			code := binary.BigEndian.Uint16(data[offset:(offset + 2)])
+			dictionaryMu.RLock()
 			route, ok := codes[code]
+			dictionaryMu.RUnlock()
 			if !ok {
 				return nil, ErrRouteInfoNotFound
 			}
@@ -225,29 +218,42 @@ func Decode(data []byte) (*Message, error) {
 }
 
 // SetDictionary set routes map which be used to compress route.
-// TODO(warning): set dictionary in runtime would be a dangerous operation!!!!!!
+// Peers must use the same dictionary when exchanging compressed routes.
 func SetDictionary(dict map[string]uint16) {
+	var warnings []string
+	dictionaryMu.Lock()
 	for route, code := range dict {
 		r := strings.TrimSpace(route)
 
 		// duplication check
 		if _, ok := routes[r]; ok {
-			log.Println(fmt.Sprintf("duplicated route(route: %s, code: %d)", r, code))
+			warnings = append(warnings, fmt.Sprintf("duplicated route(route: %s, code: %d)", r, code))
 		}
 
 		if _, ok := codes[code]; ok {
-			log.Println(fmt.Sprintf("duplicated route(route: %s, code: %d)", r, code))
+			warnings = append(warnings, fmt.Sprintf("duplicated route(route: %s, code: %d)", r, code))
 		}
 
 		// update map, using last value when key duplicated
 		routes[r] = code
 		codes[code] = r
 	}
+	dictionaryMu.Unlock()
+	for _, warning := range warnings {
+		log.Println(warning)
+	}
 }
 
+// GetDictionary returns a snapshot. Modifying it does not change the dictionary.
 func GetDictionary() (map[string]uint16, bool) {
+	dictionaryMu.RLock()
+	defer dictionaryMu.RUnlock()
 	if len(routes) <= 0 {
 		return nil, false
 	}
-	return routes, true
+	dict := make(map[string]uint16, len(routes))
+	for route, code := range routes {
+		dict[route] = code
+	}
+	return dict, true
 }

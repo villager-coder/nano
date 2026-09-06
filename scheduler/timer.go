@@ -80,13 +80,10 @@ func (t *Timer) ID() int64 {
 	return t.id
 }
 
-// Stop turns off a timer. After Stop, fn will not be called forever
+// Stop cancels subsequent scheduling. A callback already selected for execution
+// may still run. Stop does not wait for it and may be called from the callback.
 func (t *Timer) Stop() {
-	if atomic.AddInt32(&t.closed, 1) != 1 {
-		return
-	}
-
-	t.counter = 0
+	atomic.StoreInt32(&t.closed, 1)
 }
 
 // execute job function with protection
@@ -101,14 +98,14 @@ func safecall(id int64, fn TimerFunc) {
 }
 
 func cron() {
+	timerManager.muCreatedTimer.Lock()
 	if len(timerManager.createdTimer) > 0 {
-		timerManager.muCreatedTimer.Lock()
 		for _, t := range timerManager.createdTimer {
 			timerManager.timers[t.id] = t
 		}
 		timerManager.createdTimer = timerManager.createdTimer[:0]
-		timerManager.muCreatedTimer.Unlock()
 	}
+	timerManager.muCreatedTimer.Unlock()
 
 	if len(timerManager.timers) < 1 {
 		return
@@ -117,11 +114,18 @@ func cron() {
 	now := time.Now()
 	unn := now.UnixNano()
 	for id, t := range timerManager.timers {
+		if atomic.LoadInt32(&t.closed) != 0 {
+			delete(timerManager.timers, id)
+			continue
+		}
 		if t.counter == infinite || t.counter > 0 {
 			// condition timer
 			if t.condition != nil {
-				if t.condition.Check(now) {
+				if t.condition.Check(now) && atomic.LoadInt32(&t.closed) == 0 {
 					safecall(id, t.fn)
+				}
+				if atomic.LoadInt32(&t.closed) != 0 {
+					delete(timerManager.timers, id)
 				}
 				continue
 			}
@@ -138,7 +142,7 @@ func cron() {
 			}
 		}
 
-		if t.counter == 0 {
+		if t.counter == 0 || atomic.LoadInt32(&t.closed) != 0 {
 			timerManager.muClosingTimer.Lock()
 			timerManager.closingTimer = append(timerManager.closingTimer, t.id)
 			timerManager.muClosingTimer.Unlock()
@@ -146,14 +150,14 @@ func cron() {
 		}
 	}
 
+	timerManager.muClosingTimer.Lock()
 	if len(timerManager.closingTimer) > 0 {
-		timerManager.muClosingTimer.Lock()
 		for _, id := range timerManager.closingTimer {
 			delete(timerManager.timers, id)
 		}
 		timerManager.closingTimer = timerManager.closingTimer[:0]
-		timerManager.muClosingTimer.Unlock()
 	}
+	timerManager.muClosingTimer.Unlock()
 }
 
 // NewTimer returns a new Timer containing a function that will be called
@@ -171,6 +175,10 @@ func NewTimer(interval time.Duration, fn TimerFunc) *Timer {
 // The duration d must be greater than zero; if not, NewCountTimer will panic.
 // Stop the timer to release associated resources.
 func NewCountTimer(interval time.Duration, count int, fn TimerFunc) *Timer {
+	return newTimer(interval, count, nil, fn)
+}
+
+func newTimer(interval time.Duration, count int, condition TimerCondition, fn TimerFunc) *Timer {
 	if fn == nil {
 		panic("nano/timer: nil timer function")
 	}
@@ -179,12 +187,13 @@ func NewCountTimer(interval time.Duration, count int, fn TimerFunc) *Timer {
 	}
 
 	t := &Timer{
-		id:       atomic.AddInt64(&timerManager.incrementID, 1),
-		fn:       fn,
-		createAt: time.Now().UnixNano(),
-		interval: interval,
-		elapse:   int64(interval), // first execution will be after interval
-		counter:  count,
+		id:        atomic.AddInt64(&timerManager.incrementID, 1),
+		fn:        fn,
+		createAt:  time.Now().UnixNano(),
+		interval:  interval,
+		elapse:    int64(interval), // first execution will be after interval
+		counter:   count,
+		condition: condition,
 	}
 
 	timerManager.muCreatedTimer.Lock()
@@ -210,8 +219,5 @@ func NewCondTimer(condition TimerCondition, fn TimerFunc) *Timer {
 		panic("nano/timer: nil condition")
 	}
 
-	t := NewCountTimer(time.Duration(math.MaxInt64), infinite, fn)
-	t.condition = condition
-
-	return t
+	return newTimer(time.Duration(math.MaxInt64), infinite, condition, fn)
 }

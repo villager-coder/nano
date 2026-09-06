@@ -26,6 +26,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -39,6 +40,7 @@ import (
 )
 
 var running int32
+var shutdownOnce sync.Once
 
 // VERSION returns current nano version
 var VERSION = "0.5.0"
@@ -55,7 +57,7 @@ var (
 // and then calls Serve with handler to handle requests
 // on incoming connections.
 func Listen(addr string, opts ...Option) {
-	if atomic.AddInt32(&running, 1) != 1 {
+	if !atomic.CompareAndSwapInt32(&running, 0, 1) {
 		log.Println("Nano has running")
 		return
 	}
@@ -108,8 +110,9 @@ func Listen(addr string, opts ...Option) {
 	}
 
 	go scheduler.Sched()
-	sg := make(chan os.Signal)
+	sg := make(chan os.Signal, 1)
 	signal.Notify(sg, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGKILL, syscall.SIGTERM)
+	defer signal.Stop(sg)
 
 	select {
 	case <-env.Die:
@@ -128,5 +131,5 @@ func Listen(addr string, opts ...Option) {
 
 // Shutdown send a signal to let 'nano' shutdown itself.
 func Shutdown() {
-	close(env.Die)
+	shutdownOnce.Do(func() { close(env.Die) })
 }

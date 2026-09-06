@@ -68,6 +68,7 @@ func (manager *PlayerManager) Login(s *session.Session, msg *ReqPlayerLogin) err
     + [Route compression](./docs/route_compression.md)
     + [Communication protocol](./docs/communication_protocol.md)
     + [Design patterns](./docs/design_patterns.md)
+    + [Runtime lifecycle and concurrency](./docs/runtime_safety.md)
     + [API Reference(Server)](https://godoc.org/github.com/lonnng/nano)
     + [How to integrate `Lua` into `Nano` component(incomplete)](.)
 
@@ -103,7 +104,7 @@ func (manager *PlayerManager) Login(s *session.Session, msg *ReqPlayerLogin) err
 
 ## Go version
 
-`> go1.8`
+Go version is defined in [go.mod](./go.mod).
 
 ## Installation
 

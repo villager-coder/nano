@@ -110,7 +110,7 @@ func (s *Service) ExtractHandler() error {
 	if len(s.Handlers) == 0 {
 		str := ""
 		// To help the user, see if a pointer receiver would work.
-		method := s.suitableHandlerMethods(reflect.PtrTo(s.Type))
+		method := s.suitableHandlerMethods(reflect.PointerTo(s.Type))
 		if len(method) != 0 {
 			str = "type " + s.Name + " has no exported methods of suitable type (hint: pass a pointer to value of that type)"
 		} else {

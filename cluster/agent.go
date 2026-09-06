@@ -21,8 +21,10 @@
 package cluster
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"reflect"
 	"sync/atomic"
@@ -53,6 +55,7 @@ var (
 type (
 	// Agent corresponding a user, used for store raw conn information
 	agent struct {
+		closeDone chan struct{}
 		// regular agent member
 		session  *session.Session    // session
 		conn     net.Conn            // low-level conn fd
@@ -64,8 +67,12 @@ type (
 		decoder  *codec.Decoder      // binary decoder
 		pipeline pipeline.Pipeline
 
-		rpcHandler rpcHandler
-		srv        reflect.Value // cached session reflect.Value
+		ctx          context.Context
+		cancel       context.CancelFunc
+		onClose      func()
+		writeTimeout time.Duration
+		rpcHandler   rpcHandler
+		srv          reflect.Value // cached session reflect.Value
 	}
 
 	pendingMessage struct {
@@ -73,13 +80,16 @@ type (
 		route   string       // message route(push)
 		mid     uint64       // response message id(response)
 		payload interface{}  // payload
+		packet  []byte       // pre-encoded control packet
 	}
 )
 
 // Create new agent instance
 func newAgent(conn net.Conn, pipeline pipeline.Pipeline, rpcHandler rpcHandler) *agent {
-	a := &agent{
+	ctx, cancel := context.WithCancel(context.Background())
+	a := &agent{ctx: ctx, cancel: cancel, writeTimeout: 5 * time.Second,
 		conn:       conn,
+		closeDone:  make(chan struct{}),
 		state:      statusStart,
 		chDie:      make(chan struct{}),
 		lastAt:     time.Now().Unix(),
@@ -90,26 +100,30 @@ func newAgent(conn net.Conn, pipeline pipeline.Pipeline, rpcHandler rpcHandler) 
 	}
 
 	// binding session
-	s := session.New(a)
+	s := session.NewWithContext(ctx, a)
 	a.session = s
 	a.srv = reflect.ValueOf(s)
 
 	return a
 }
 
-func (a *agent) send(m pendingMessage) (err error) {
-	defer func() {
-		if e := recover(); e != nil {
-			err = ErrBrokenPipe
-		}
-	}()
-	a.chSend <- m
-	return
+func (a *agent) send(m pendingMessage) error {
+	if a.status() == statusClosed {
+		return ErrBrokenPipe
+	}
+	select {
+	case <-a.chDie:
+		return ErrBrokenPipe
+	case a.chSend <- m:
+		return nil
+	default:
+		return ErrBufferExceed
+	}
 }
 
 // LastMid implements the session.NetworkEntity interface
 func (a *agent) LastMid() uint64 {
-	return a.lastMid
+	return atomic.LoadUint64(&a.lastMid)
 }
 
 // Push, implementation for session.NetworkEntity interface
@@ -138,6 +152,10 @@ func (a *agent) Push(route string, v interface{}) error {
 
 // RPC, implementation for session.NetworkEntity interface
 func (a *agent) RPC(route string, v interface{}) error {
+	return a.RPCContext(a.ctx, route, v)
+}
+
+func (a *agent) RPCContext(ctx context.Context, route string, v interface{}) error {
 	if a.status() == statusClosed {
 		return ErrBrokenPipe
 	}
@@ -152,14 +170,20 @@ func (a *agent) RPC(route string, v interface{}) error {
 		Route: route,
 		Data:  data,
 	}
-	a.rpcHandler(a.session, msg, true)
-	return nil
+	if ctx == nil {
+		ctx = a.ctx
+	}
+	callCtx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(a.ctx, cancel)
+	defer stop()
+	defer cancel()
+	return a.rpcHandler(callCtx, a.session, msg, true)
 }
 
 // Response, implementation for session.NetworkEntity interface
 // Response message to session
 func (a *agent) Response(v interface{}) error {
-	return a.ResponseMid(a.lastMid, v)
+	return a.ResponseMid(a.LastMid(), v)
 }
 
 // ResponseMid, implementation for session.NetworkEntity interface
@@ -195,26 +219,32 @@ func (a *agent) ResponseMid(mid uint64, v interface{}) error {
 // Close closes the agent, clean inner state and close low-level connection.
 // Any blocked Read or Write operations will be unblocked and return errors.
 func (a *agent) Close() error {
-	if a.status() == statusClosed {
+	if atomic.SwapInt32(&a.state, statusClosed) == statusClosed {
+		if a.closeDone != nil {
+			<-a.closeDone
+		}
 		return ErrCloseClosedSession
 	}
-	a.setStatus(statusClosed)
 
+	if a.closeDone != nil {
+		defer close(a.closeDone)
+	}
 	if env.Debug {
 		log.Println(fmt.Sprintf("Session closed, ID=%d, UID=%d, IP=%s",
 			a.session.ID(), a.session.UID(), a.conn.RemoteAddr()))
 	}
 
-	// prevent closing closed channel
-	select {
-	case <-a.chDie:
-		// expect
-	default:
-		close(a.chDie)
-		scheduler.PushTask(func() { session.Lifetime.Close(a.session) })
+	close(a.chDie)
+	if a.cancel != nil {
+		a.cancel()
 	}
-
-	return a.conn.Close()
+	err := a.conn.Close()
+	if a.onClose != nil {
+		a.onClose()
+	} else if err := scheduler.PushFinalizer(func() { session.Lifetime.Close(a.session) }); err != nil {
+		log.Println(err)
+	}
+	return err
 }
 
 // RemoteAddr, implementation for session.NetworkEntity interface
@@ -233,17 +263,19 @@ func (a *agent) status() int32 {
 }
 
 func (a *agent) setStatus(state int32) {
-	atomic.StoreInt32(&a.state, state)
+	for {
+		old := a.status()
+		if old == statusClosed || atomic.CompareAndSwapInt32(&a.state, old, state) {
+			return
+		}
+	}
 }
 
 func (a *agent) write() {
 	ticker := time.NewTicker(env.Heartbeat)
-	chWrite := make(chan []byte, agentWriteBacklog)
 	// clean func
 	defer func() {
 		ticker.Stop()
-		close(a.chSend)
-		close(chWrite)
 		a.Close()
 		if env.Debug {
 			log.Println(fmt.Sprintf("Session write goroutine exit, SessionID=%d, UID=%d", a.session.ID(), a.session.UID()))
@@ -258,16 +290,19 @@ func (a *agent) write() {
 				log.Println(fmt.Sprintf("Session heartbeat timeout, LastTime=%d, Deadline=%d", atomic.LoadInt64(&a.lastAt), deadline))
 				return
 			}
-			chWrite <- hbd
-
-		case data := <-chWrite:
-			// close agent while low-level conn broken
-			if _, err := a.conn.Write(data); err != nil {
-				log.Println(err.Error())
-				return
+			if a.status() == statusWorking {
+				if err := a.writePacket(hbd); err != nil {
+					return
+				}
 			}
 
 		case data := <-a.chSend:
+			if data.packet != nil {
+				if err := a.writePacket(data.packet); err != nil {
+					return
+				}
+				continue
+			}
 			payload, err := message.Serialize(data.payload)
 			if err != nil {
 				switch data.typ {
@@ -308,7 +343,9 @@ func (a *agent) write() {
 				log.Println(err)
 				break
 			}
-			chWrite <- p
+			if err := a.writePacket(p); err != nil {
+				return
+			}
 
 		case <-a.chDie: // agent closed signal
 			return
@@ -317,4 +354,26 @@ func (a *agent) write() {
 			return
 		}
 	}
+}
+
+// writePacket is only called by the write goroutine, including for handshakes.
+func (a *agent) writePacket(data []byte) error {
+	timeout := a.writeTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	if err := a.conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		return err
+	}
+	for len(data) > 0 {
+		n, err := a.conn.Write(data)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
 }

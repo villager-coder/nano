@@ -57,11 +57,12 @@ type (
 
 	// Connector is a tiny Nano client
 	Connector struct {
-		conn   net.Conn       // low-level connection
-		codec  *codec.Decoder // decoder
-		die    chan struct{}  // connector close channel
-		chSend chan []byte    // send queue
-		mid    uint64         // message id
+		closeOnce sync.Once
+		conn      net.Conn       // low-level connection
+		codec     *codec.Decoder // decoder
+		die       chan struct{}  // connector close channel
+		chSend    chan []byte    // send queue
+		mid       uint64         // message id
 
 		// events handler
 		muEvents sync.RWMutex
@@ -160,8 +161,12 @@ func (c *Connector) On(event string, callback Callback) {
 
 // Close close the connection, and shutdown the benchmark
 func (c *Connector) Close() {
-	c.conn.Close()
-	close(c.die)
+	c.closeOnce.Do(func() {
+		close(c.die)
+		if c.conn != nil {
+			c.conn.Close()
+		}
+	})
 }
 
 func (c *Connector) eventHandler(event string) (Callback, bool) {
@@ -211,7 +216,7 @@ func (c *Connector) sendMessage(msg *message.Message) error {
 }
 
 func (c *Connector) write() {
-	defer close(c.chSend)
+	defer c.Close()
 
 	for {
 		select {
@@ -228,7 +233,10 @@ func (c *Connector) write() {
 }
 
 func (c *Connector) send(data []byte) {
-	c.chSend <- data
+	select {
+	case c.chSend <- data:
+	case <-c.die:
+	}
 }
 
 func (c *Connector) read() {

@@ -8,7 +8,6 @@ import (
 	"github.com/lonng/nano/benchmark/testdata"
 	"github.com/lonng/nano/cluster"
 	"github.com/lonng/nano/component"
-	"github.com/lonng/nano/scheduler"
 	"github.com/lonng/nano/session"
 	. "github.com/pingcap/check"
 )
@@ -48,8 +47,6 @@ func TestNode(t *testing.T) {
 }
 
 func (s *nodeSuite) TestNodeStartup(c *C) {
-	go scheduler.Sched()
-	defer scheduler.Close()
 
 	masterComps := &component.Components{}
 	masterComps.Register(&MasterComponent{})
@@ -58,10 +55,11 @@ func (s *nodeSuite) TestNodeStartup(c *C) {
 			IsMaster:   true,
 			Components: masterComps,
 		},
-		ServiceAddr: "127.0.0.1:4450",
+		ServiceAddr: "127.0.0.1:0",
 	}
 	err := masterNode.Startup()
 	c.Assert(err, IsNil)
+	defer masterNode.Shutdown()
 	masterHandler := masterNode.Handler()
 	c.Assert(masterHandler.LocalService(), DeepEquals, []string{"MasterComponent"})
 
@@ -69,14 +67,15 @@ func (s *nodeSuite) TestNodeStartup(c *C) {
 	member1Comps.Register(&GateComponent{})
 	memberNode1 := &cluster.Node{
 		Options: cluster.Options{
-			AdvertiseAddr: "127.0.0.1:4450",
-			ClientAddr:    "127.0.0.1:14452",
+			AdvertiseAddr: masterNode.ServiceAddr,
+			ClientAddr:    "127.0.0.1:0",
 			Components:    member1Comps,
 		},
-		ServiceAddr: "127.0.0.1:14451",
+		ServiceAddr: "127.0.0.1:0",
 	}
 	err = memberNode1.Startup()
 	c.Assert(err, IsNil)
+	defer memberNode1.Shutdown()
 	member1Handler := memberNode1.Handler()
 	c.Assert(masterHandler.LocalService(), DeepEquals, []string{"MasterComponent"})
 	c.Assert(masterHandler.RemoteService(), DeepEquals, []string{"GateComponent"})
@@ -87,13 +86,14 @@ func (s *nodeSuite) TestNodeStartup(c *C) {
 	member2Comps.Register(&GameComponent{})
 	memberNode2 := &cluster.Node{
 		Options: cluster.Options{
-			AdvertiseAddr: "127.0.0.1:4450",
+			AdvertiseAddr: masterNode.ServiceAddr,
 			Components:    member2Comps,
 		},
-		ServiceAddr: "127.0.0.1:24451",
+		ServiceAddr: "127.0.0.1:0",
 	}
 	err = memberNode2.Startup()
 	c.Assert(err, IsNil)
+	defer memberNode2.Shutdown()
 	member2Handler := memberNode2.Handler()
 	c.Assert(masterHandler.LocalService(), DeepEquals, []string{"MasterComponent"})
 	c.Assert(masterHandler.RemoteService(), DeepEquals, []string{"GameComponent", "GateComponent"})
@@ -103,6 +103,7 @@ func (s *nodeSuite) TestNodeStartup(c *C) {
 	c.Assert(member2Handler.RemoteService(), DeepEquals, []string{"GateComponent", "MasterComponent"})
 
 	connector := io.NewConnector()
+	defer connector.Close()
 
 	chWait := make(chan struct{})
 	connector.OnConnected(func() {
@@ -110,7 +111,7 @@ func (s *nodeSuite) TestNodeStartup(c *C) {
 	})
 
 	// Connect to gate server
-	if err := connector.Start("127.0.0.1:14452"); err != nil {
+	if err := connector.Start(memberNode1.ClientAddr); err != nil {
 		c.Assert(err, IsNil)
 	}
 	<-chWait

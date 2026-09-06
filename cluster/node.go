@@ -22,6 +22,7 @@ package cluster
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -42,7 +43,8 @@ import (
 	"google.golang.org/grpc"
 )
 
-// Options contains some configurations for current node
+var ErrNodeStopped = errors.New("node stopped")
+
 type Options struct {
 	Pipeline           pipeline.Pipeline
 	IsMaster           bool
@@ -56,287 +58,454 @@ type Options struct {
 	TSLKey             string
 	UnregisterCallback func(Member)
 	RemoteServiceRoute CustomerRemoteServiceRoute
+	RPCTimeout         time.Duration
+	WriteTimeout       time.Duration
+	ShutdownTimeout    time.Duration
 }
 
-// Node represents a node in nano cluster, which will contains a group of services.
-// All services will register to cluster and messages will be forwarded to the node
-// which provides respective service
 type Node struct {
-	Options            // current node options
-	ServiceAddr string // current server service address (RPC)
+	started     bool
+	startupDone chan struct{}
+	Options
+	ServiceAddr    string
+	cluster        *cluster
+	handler        *LocalHandler
+	server         *grpc.Server
+	rpcClient      *rpcClient
+	clientListener net.Listener
+	httpServer     *http.Server
 
-	cluster   *cluster
-	handler   *LocalHandler
-	server    *grpc.Server
-	rpcClient *rpcClient
-
-	mu       sync.RWMutex
-	sessions map[int64]*session.Session
-
-	once          sync.Once
-	keepaliveExit chan struct{}
+	mu           sync.RWMutex
+	sessions     map[int64]*session.Session
+	stopping     bool
+	ctx          context.Context
+	cancel       context.CancelFunc
+	shutdownOnce sync.Once
+	connections  sync.WaitGroup
+	workers      sync.WaitGroup
+	tasks        sync.WaitGroup
+	initialized  bool
 }
 
-func (n *Node) Startup() error {
-	if n.ServiceAddr == "" {
-		return errors.New("service address cannot be empty in master node")
+// Startup binds the listening sockets before reporting success.
+func (n *Node) Startup() error { return n.StartupContext(context.Background()) }
+
+// StartupContext allows cancellation while registering with the master.
+func (n *Node) StartupContext(parent context.Context) (err error) {
+	n.mu.Lock()
+	if n.started || n.stopping {
+		n.mu.Unlock()
+		return errors.New("node already started or stopped")
 	}
-	n.sessions = map[int64]*session.Session{}
+	n.started = true
+	n.startupDone = make(chan struct{})
+	n.ctx, n.cancel = context.WithCancel(parent)
+	n.mu.Unlock()
+	defer func() {
+		close(n.startupDone)
+		if err != nil {
+			n.Shutdown()
+		}
+	}()
+
+	if n.ServiceAddr == "" {
+		return errors.New("service address cannot be empty")
+	}
+	if n.Components == nil {
+		n.Components = &component.Components{}
+	}
+	if n.RetryInterval <= 0 {
+		n.RetryInterval = 3 * time.Second
+	}
+	n.sessions = make(map[int64]*session.Session)
 	n.cluster = newCluster(n)
 	n.handler = NewHandler(n, n.Pipeline)
 	components := n.Components.List()
 	for _, c := range components {
-		err := n.handler.register(c.Comp, c.Opts)
-		if err != nil {
+		if err = n.handler.register(c.Comp, c.Opts); err != nil {
 			return err
 		}
 	}
-
-	cache()
-	if err := n.initNode(); err != nil {
+	if err = n.initNode(); err != nil {
 		return err
 	}
-
-	// Initialize all components
 	for _, c := range components {
 		c.Comp.Init()
 	}
 	for _, c := range components {
 		c.Comp.AfterInit()
 	}
-
+	n.initialized = true
 	if n.ClientAddr != "" {
-		go func() {
-			if n.IsWebsocket {
-				if len(n.TSLCertificate) != 0 {
-					n.listenAndServeWSTLS()
-				} else {
-					n.listenAndServeWS()
-				}
-			} else {
-				n.listenAndServe()
-			}
-		}()
+		if err = n.startClientListener(); err != nil {
+			return err
+		}
 	}
-
+	if n.IsMaster {
+		n.cluster.checkMemberHeartbeat()
+	} else if n.AdvertiseAddr != "" {
+		n.keepalive()
+	}
 	return nil
 }
 
-func (n *Node) Handler() *LocalHandler {
-	return n.handler
+func (n *Node) Handler() *LocalHandler { return n.handler }
+func (n *Node) context() context.Context {
+	if n.ctx != nil {
+		return n.ctx
+	}
+	return context.Background()
+}
+func (n *Node) writeTimeout() time.Duration {
+	if n.WriteTimeout > 0 {
+		return n.WriteTimeout
+	}
+	return 5 * time.Second
+}
+func (n *Node) rpcContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	timeout := n.RPCTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	stop := context.AfterFunc(n.context(), cancel)
+	if n.context().Err() != nil {
+		cancel()
+	}
+	context.AfterFunc(ctx, func() { stop() })
+	return ctx, func() { stop(); cancel() }
+}
+
+// A successful HandleRequest/Notify acknowledges admission, not completion.
+// Its transport context ends at that ACK. Preserve its deadline and values for
+// queued work, and continue to honor the node's lifetime.
+func (n *Node) admittedContext(incoming context.Context, lifetime context.Context) (context.Context, context.CancelFunc) {
+	parent := context.WithoutCancel(incoming)
+	finishParent := func() {}
+	if deadline, ok := incoming.Deadline(); ok {
+		parent, finishParent = context.WithDeadline(parent, deadline)
+	}
+	ctx, cancel := n.rpcContext(parent)
+	stop := context.AfterFunc(lifetime, cancel)
+	context.AfterFunc(ctx, func() { stop(); finishParent() })
+	if lifetime.Err() != nil {
+		cancel()
+	}
+	return ctx, func() { stop(); cancel(); finishParent() }
 }
 
 func (n *Node) initNode() error {
-	// Current node is not master server and does not contains master
-	// address, so running in singleton mode
 	if !n.IsMaster && n.AdvertiseAddr == "" {
 		return nil
 	}
-
 	listener, err := net.Listen("tcp", n.ServiceAddr)
 	if err != nil {
 		return err
 	}
-
-	// Initialize the gRPC server and register service
+	if strings.HasSuffix(n.ServiceAddr, ":0") {
+		n.ServiceAddr = listener.Addr().String()
+	}
 	n.server = grpc.NewServer()
 	n.rpcClient = newRPCClient()
 	clusterpb.RegisterMemberServer(n.server, n)
-
-	go func() {
-		err := n.server.Serve(listener)
-		if err != nil {
-			log.Fatalf("Start current node failed: %v", err)
-		}
-	}()
-
 	if n.IsMaster {
 		clusterpb.RegisterMasterServer(n.server, n.cluster)
-		member := &Member{
-			isMaster: true,
-			memberInfo: &clusterpb.MemberInfo{
-				Label:       n.Label,
-				ServiceAddr: n.ServiceAddr,
-				Services:    n.handler.LocalService(),
-			},
-		}
-		n.cluster.members = append(n.cluster.members, member)
+		n.cluster.members = []*Member{{isMaster: true, memberInfo: n.memberInfo()}}
 		n.cluster.setRpcClient(n.rpcClient)
-	} else {
-		pool, err := n.rpcClient.getConnPool(n.AdvertiseAddr)
+	}
+	// All services must be registered before Serve starts.
+	n.workers.Add(1)
+	go func() {
+		defer n.workers.Done()
+		defer listener.Close()
+		if err := n.server.Serve(listener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			log.Println("RPC server stopped", err)
+		}
+	}()
+	if n.IsMaster {
+		return nil
+	}
+	pool, err := n.rpcClient.getConnPoolContext(n.context(), n.AdvertiseAddr)
+	if err != nil {
+		return err
+	}
+	client := clusterpb.NewMasterClient(pool.Get())
+	for {
+		ctx, cancel := n.rpcContext(n.context())
+		response, err := client.Register(ctx, &clusterpb.RegisterRequest{MemberInfo: n.memberInfo()})
+		cancel()
+		if err == nil {
+			n.handler.initRemoteService(response.Members)
+			n.cluster.initMembers(response.Members)
+			return nil
+		}
+		log.Println("Register failed", err)
+		timer := time.NewTimer(n.RetryInterval)
+		select {
+		case <-n.context().Done():
+			timer.Stop()
+			return n.context().Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (n *Node) memberInfo() *clusterpb.MemberInfo {
+	return &clusterpb.MemberInfo{Label: n.Label, ServiceAddr: n.ServiceAddr, Services: n.handler.LocalService()}
+}
+
+func (n *Node) startClientListener() error {
+	listener, err := net.Listen("tcp", n.ClientAddr)
+	if err != nil {
+		return err
+	}
+	if n.IsWebsocket && n.TSLCertificate != "" {
+		certificate, err := tls.LoadX509KeyPair(n.TSLCertificate, n.TSLKey)
 		if err != nil {
+			listener.Close()
 			return err
 		}
-		client := clusterpb.NewMasterClient(pool.Get())
-		request := &clusterpb.RegisterRequest{
-			MemberInfo: &clusterpb.MemberInfo{
-				Label:       n.Label,
-				ServiceAddr: n.ServiceAddr,
-				Services:    n.handler.LocalService(),
-			},
+		listener = tls.NewListener(listener, &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12})
+	}
+	n.clientListener = listener
+	if strings.HasSuffix(n.ClientAddr, ":0") {
+		n.ClientAddr = listener.Addr().String()
+	}
+	if n.IsWebsocket {
+		mux := http.NewServeMux()
+		upgrader := websocket.Upgrader{ReadBufferSize: 1024, WriteBufferSize: 1024, CheckOrigin: env.CheckOrigin}
+		mux.HandleFunc("/"+strings.TrimPrefix(env.WSPath, "/"), func(w http.ResponseWriter, r *http.Request) {
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			n.handler.handleWS(conn)
+		})
+		n.httpServer = &http.Server{Handler: mux, ReadHeaderTimeout: n.writeTimeout()}
+	}
+	n.workers.Add(1)
+	go func() {
+		defer n.workers.Done()
+		if n.httpServer != nil {
+			if err := n.httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+				log.Println(err)
+			}
+			return
 		}
 		for {
-			resp, err := client.Register(context.Background(), request)
-			if err == nil {
-				n.handler.initRemoteService(resp.Members)
-				n.cluster.initMembers(resp.Members)
-				break
+			conn, err := listener.Accept()
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				select {
+				case <-n.context().Done():
+					return
+				default:
+				}
+				log.Println(err)
+				return
 			}
-			log.Println("Register current node to cluster failed", err, "and will retry in", n.RetryInterval.String())
-			time.Sleep(n.RetryInterval)
+			n.serveConn(conn)
 		}
-		n.once.Do(n.keepalive)
-	}
+	}()
 	return nil
 }
 
-// Shutdowns all components registered by application, that
-// call by reverse order against register
-func (n *Node) Shutdown() {
-	// reverse call `BeforeShutdown` hooks
-	components := n.Components.List()
-	length := len(components)
-	for i := length - 1; i >= 0; i-- {
-		components[i].Comp.BeforeShutdown()
-	}
-
-	// reverse call `Shutdown` hooks
-	for i := length - 1; i >= 0; i-- {
-		components[i].Comp.Shutdown()
-	}
-	// close sendHeartbeat
-	if n.keepaliveExit != nil {
-		close(n.keepaliveExit)
-	}
-	if !n.IsMaster && n.AdvertiseAddr != "" {
-		pool, err := n.rpcClient.getConnPool(n.AdvertiseAddr)
-		if err != nil {
-			log.Println("Retrieve master address error", err)
-			goto EXIT
-		}
-		client := clusterpb.NewMasterClient(pool.Get())
-		request := &clusterpb.UnregisterRequest{
-			ServiceAddr: n.ServiceAddr,
-		}
-		_, err = client.Unregister(context.Background(), request)
-		if err != nil {
-			log.Println("Unregister current node failed", err)
-			goto EXIT
-		}
-	}
-
-EXIT:
-	if n.server != nil {
-		n.server.GracefulStop()
-	}
-}
-
-// Enable current server accept connection
-func (n *Node) listenAndServe() {
-	listener, err := net.Listen("tcp", n.ClientAddr)
-	if err != nil {
-		log.Fatal(err.Error())
-	}
-
-	defer listener.Close()
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			log.Println(err.Error())
-			continue
-		}
-
-		go n.handler.handle(conn)
-	}
-}
-
-func (n *Node) listenAndServeWS() {
-	var upgrader = websocket.Upgrader{
-		ReadBufferSize:  1024,
-		WriteBufferSize: 1024,
-		CheckOrigin:     env.CheckOrigin,
-	}
-
-	http.HandleFunc("/"+strings.TrimPrefix(env.WSPath, "/"), func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			log.Println(fmt.Sprintf("Upgrade failure, URI=%s, Error=%s", r.RequestURI, err.Error()))
-			return
-		}
-
-		n.handler.handleWS(conn)
-	})
-
-	if err := http.ListenAndServe(n.ClientAddr, nil); err != nil {
-		log.Fatal(err.Error())
-	}
-}
-
-func (n *Node) listenAndServeWSTLS() {
-	var upgrader = websocket.Upgrader{
-		ReadBufferSize:  1024,
-		WriteBufferSize: 1024,
-		CheckOrigin:     env.CheckOrigin,
-	}
-
-	http.HandleFunc("/"+strings.TrimPrefix(env.WSPath, "/"), func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			log.Println(fmt.Sprintf("Upgrade failure, URI=%s, Error=%s", r.RequestURI, err.Error()))
-			return
-		}
-
-		n.handler.handleWS(conn)
-	})
-
-	if err := http.ListenAndServeTLS(n.ClientAddr, n.TSLCertificate, n.TSLKey, nil); err != nil {
-		log.Fatal(err.Error())
-	}
-}
-
-func (n *Node) storeSession(s *session.Session) {
+func (n *Node) serveConn(conn net.Conn) {
 	n.mu.Lock()
+	if n.stopping {
+		n.mu.Unlock()
+		conn.Close()
+		return
+	}
+	n.connections.Add(1)
+	n.mu.Unlock()
+	go func() { defer n.connections.Done(); n.handler.handle(conn) }()
+}
+
+func (n *Node) beginTask() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.stopping {
+		return false
+	}
+	n.tasks.Add(1)
+	return true
+}
+
+func waitGroup(ctx context.Context, wg *sync.WaitGroup) {
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+}
+
+// Shutdown is idempotent. Network/RPC waits share a bounded shutdown budget;
+// application hooks remain responsible for terminating their own work.
+func (n *Node) Shutdown() {
+	n.shutdownOnce.Do(func() {
+		n.mu.Lock()
+		n.stopping = true
+		cancelStartup, startupDone := n.cancel, n.startupDone
+		n.mu.Unlock()
+		if cancelStartup != nil {
+			cancelStartup()
+		}
+		if startupDone != nil {
+			<-startupDone
+		}
+
+		timeout := n.ShutdownTimeout
+		if timeout <= 0 {
+			timeout = 10 * time.Second
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		n.mu.Lock()
+		n.stopping = true
+		sessions := make([]*session.Session, 0, len(n.sessions))
+		for _, s := range n.sessions {
+			sessions = append(sessions, s)
+		}
+		n.sessions = make(map[int64]*session.Session)
+		n.mu.Unlock()
+		if n.clientListener != nil {
+			n.clientListener.Close()
+		}
+		if n.httpServer != nil {
+			n.httpServer.Close()
+		}
+		if n.cancel != nil {
+			n.cancel()
+		}
+		for _, s := range sessions {
+			if ac, ok := s.NetworkEntity().(*acceptor); ok {
+				ac.closeLocal()
+				n.finalizeSession(s)
+			} else {
+				s.Close()
+			}
+		}
+		if !n.IsMaster && n.AdvertiseAddr != "" && n.rpcClient != nil {
+			if pool, err := n.rpcClient.getConnPoolContext(ctx, n.AdvertiseAddr); err == nil {
+				_, err = clusterpb.NewMasterClient(pool.Get()).Unregister(ctx, &clusterpb.UnregisterRequest{ServiceAddr: n.ServiceAddr})
+				if err != nil {
+					log.Println("Unregister failed", err)
+				}
+			}
+		}
+		if n.server != nil {
+			stopped := make(chan struct{})
+			go func() { n.server.GracefulStop(); close(stopped) }()
+			select {
+			case <-stopped:
+			case <-ctx.Done():
+				n.server.Stop()
+				<-stopped
+			}
+		}
+		if n.rpcClient != nil {
+			n.rpcClient.closePool()
+		}
+		waitGroup(ctx, &n.connections)
+		waitGroup(ctx, &n.workers)
+		waitGroup(ctx, &n.tasks)
+		if n.initialized {
+			components := n.Components.List()
+			for i := len(components) - 1; i >= 0; i-- {
+				components[i].Comp.BeforeShutdown()
+			}
+			for i := len(components) - 1; i >= 0; i-- {
+				components[i].Comp.Shutdown()
+			}
+		}
+	})
+}
+
+func (n *Node) storeSession(s *session.Session) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.stopping {
+		return false
+	}
 	n.sessions[s.ID()] = s
+	return true
+}
+func (n *Node) removeSession(sid int64, expected *session.Session) {
+	n.mu.Lock()
+	if n.sessions[sid] == expected {
+		delete(n.sessions, sid)
+	}
 	n.mu.Unlock()
 }
-
 func (n *Node) findSession(sid int64) *session.Session {
 	n.mu.RLock()
-	s := n.sessions[sid]
-	n.mu.RUnlock()
-	return s
+	defer n.mu.RUnlock()
+	return n.sessions[sid]
 }
-
-func (n *Node) findOrCreateSession(sid int64, gateAddr string) (*session.Session, error) {
+func (n *Node) findOrCreateSession(sid int64, gateAddr string, contexts ...context.Context) (*session.Session, error) {
 	n.mu.RLock()
-	s, found := n.sessions[sid]
+	s, stopped := n.sessions[sid], n.stopping
 	n.mu.RUnlock()
-	if !found {
-		conns, err := n.rpcClient.getConnPool(gateAddr)
-		if err != nil {
-			return nil, err
-		}
-		ac := &acceptor{
-			sid:        sid,
-			gateClient: clusterpb.NewMemberClient(conns.Get()),
-			rpcHandler: n.handler.remoteProcess,
-			gateAddr:   gateAddr,
-		}
-		s = session.New(ac)
-		ac.session = s
-		n.mu.Lock()
-		n.sessions[sid] = s
-		n.mu.Unlock()
+	if stopped {
+		return nil, ErrNodeStopped
 	}
+	if s != nil {
+		return s, nil
+	}
+	parent := n.context()
+	if len(contexts) > 0 {
+		parent = contexts[0]
+	}
+	conns, err := n.rpcClient.getConnPoolContext(parent, gateAddr)
+	if err != nil {
+		return nil, err
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.stopping {
+		return nil, ErrNodeStopped
+	}
+	if s = n.sessions[sid]; s != nil {
+		return s, nil
+	}
+	ctx, cancel := context.WithCancel(n.context())
+	ac := &acceptor{sid: sid, gateClient: clusterpb.NewMemberClient(conns.Get()),
+		rpcHandler: n.handler.remoteProcess, gateAddr: gateAddr, node: n, ctx: ctx, cancel: cancel}
+	s = session.NewWithContext(ctx, ac)
+	ac.session = s
+	n.sessions[sid] = s
 	return s, nil
 }
 
-func (n *Node) HandleRequest(_ context.Context, req *clusterpb.RequestMessage) (*clusterpb.MemberHandleResponse, error) {
+func (n *Node) closeRemoteSessions(gateAddr string) {
+	n.mu.Lock()
+	var removed []*session.Session
+	for sid, s := range n.sessions {
+		if ac, ok := s.NetworkEntity().(*acceptor); ok && ac.gateAddr == gateAddr {
+			delete(n.sessions, sid)
+			ac.closeLocal()
+			removed = append(removed, s)
+		}
+	}
+	n.mu.Unlock()
+	for _, s := range removed {
+		n.finalizeSession(s)
+	}
+}
+
+func (n *Node) HandleRequest(ctx context.Context, req *clusterpb.RequestMessage) (*clusterpb.MemberHandleResponse, error) {
 	handler, found := n.handler.localHandlers[req.Route]
 	if !found {
 		return nil, fmt.Errorf("service not found in current node: %v", req.Route)
 	}
-	s, err := n.findOrCreateSession(req.SessionId, req.GateAddr)
+	s, err := n.findOrCreateSession(req.SessionId, req.GateAddr, ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -346,16 +515,24 @@ func (n *Node) HandleRequest(_ context.Context, req *clusterpb.RequestMessage) (
 		Route: req.Route,
 		Data:  req.Data,
 	}
-	n.handler.localProcess(handler, req.Id, s, msg)
-	return &clusterpb.MemberHandleResponse{}, nil
+	requestCtx, cancel := n.admittedContext(ctx, s.Context())
+	if err := ctx.Err(); err != nil {
+		cancel()
+		return nil, err
+	}
+	err = n.handler.localProcess(handler, req.Id, s.WithRequest(requestCtx, req.Id), msg)
+	if err != nil {
+		cancel()
+	}
+	return &clusterpb.MemberHandleResponse{}, err
 }
 
-func (n *Node) HandleNotify(_ context.Context, req *clusterpb.NotifyMessage) (*clusterpb.MemberHandleResponse, error) {
+func (n *Node) HandleNotify(ctx context.Context, req *clusterpb.NotifyMessage) (*clusterpb.MemberHandleResponse, error) {
 	handler, found := n.handler.localHandlers[req.Route]
 	if !found {
 		return nil, fmt.Errorf("service not found in current node: %v", req.Route)
 	}
-	s, err := n.findOrCreateSession(req.SessionId, req.GateAddr)
+	s, err := n.findOrCreateSession(req.SessionId, req.GateAddr, ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -364,24 +541,32 @@ func (n *Node) HandleNotify(_ context.Context, req *clusterpb.NotifyMessage) (*c
 		Route: req.Route,
 		Data:  req.Data,
 	}
-	n.handler.localProcess(handler, 0, s, msg)
-	return &clusterpb.MemberHandleResponse{}, nil
+	requestCtx, cancel := n.admittedContext(ctx, s.Context())
+	if err := ctx.Err(); err != nil {
+		cancel()
+		return nil, err
+	}
+	err = n.handler.localProcess(handler, 0, s.WithRequest(requestCtx, 0), msg)
+	if err != nil {
+		cancel()
+	}
+	return &clusterpb.MemberHandleResponse{}, err
 }
 
-func (n *Node) HandlePush(_ context.Context, req *clusterpb.PushMessage) (*clusterpb.MemberHandleResponse, error) {
+func (n *Node) HandlePush(ctx context.Context, req *clusterpb.PushMessage) (*clusterpb.MemberHandleResponse, error) {
 	s := n.findSession(req.SessionId)
 	if s == nil {
 		return &clusterpb.MemberHandleResponse{}, fmt.Errorf("session not found: %v", req.SessionId)
 	}
-	return &clusterpb.MemberHandleResponse{}, s.Push(req.Route, req.Data)
+	return &clusterpb.MemberHandleResponse{}, s.PushContext(ctx, req.Route, req.Data)
 }
 
-func (n *Node) HandleResponse(_ context.Context, req *clusterpb.ResponseMessage) (*clusterpb.MemberHandleResponse, error) {
+func (n *Node) HandleResponse(ctx context.Context, req *clusterpb.ResponseMessage) (*clusterpb.MemberHandleResponse, error) {
 	s := n.findSession(req.SessionId)
 	if s == nil {
 		return &clusterpb.MemberHandleResponse{}, fmt.Errorf("session not found: %v", req.SessionId)
 	}
-	return &clusterpb.MemberHandleResponse{}, s.ResponseMID(req.Id, req.Data)
+	return &clusterpb.MemberHandleResponse{}, s.WithRequest(ctx, req.Id).Response(req.Data)
 }
 
 func (n *Node) NewMember(_ context.Context, req *clusterpb.NewMemberRequest) (*clusterpb.NewMemberResponse, error) {
@@ -394,6 +579,7 @@ func (n *Node) DelMember(_ context.Context, req *clusterpb.DelMemberRequest) (*c
 	log.Println("DelMember member", req.String())
 	n.handler.delMember(req.ServiceAddr)
 	n.cluster.delMember(req.ServiceAddr)
+	n.closeRemoteSessions(req.ServiceAddr)
 	return &clusterpb.DelMemberResponse{}, nil
 }
 
@@ -404,7 +590,10 @@ func (n *Node) SessionClosed(_ context.Context, req *clusterpb.SessionClosedRequ
 	delete(n.sessions, req.SessionId)
 	n.mu.Unlock()
 	if found {
-		scheduler.PushTask(func() { session.Lifetime.Close(s) })
+		if ac, ok := s.NetworkEntity().(*acceptor); ok {
+			ac.closeLocal()
+		}
+		n.finalizeSession(s)
 	}
 	return &clusterpb.SessionClosedResponse{}, nil
 }
@@ -421,42 +610,40 @@ func (n *Node) CloseSession(_ context.Context, req *clusterpb.CloseSessionReques
 	return &clusterpb.CloseSessionResponse{}, nil
 }
 
-// ticker send heartbeat register info to master
 func (n *Node) keepalive() {
-	if n.keepaliveExit == nil {
-		n.keepaliveExit = make(chan struct{})
-	}
-	if n.AdvertiseAddr == "" || n.IsMaster {
-		return
-	}
-	heartbeat := func() {
-		pool, err := n.rpcClient.getConnPool(n.AdvertiseAddr)
-		if err != nil {
-			log.Println("rpcClient master conn", err)
-			return
-		}
-		masterCli := clusterpb.NewMasterClient(pool.Get())
-		if _, err := masterCli.Heartbeat(context.Background(), &clusterpb.HeartbeatRequest{
-			MemberInfo: &clusterpb.MemberInfo{
-				Label:       n.Label,
-				ServiceAddr: n.ServiceAddr,
-				Services:    n.handler.LocalService(),
-			},
-		}); err != nil {
-			log.Println("Member send heartbeat error", err)
-		}
-	}
+	n.workers.Add(1)
 	go func() {
+		defer n.workers.Done()
 		ticker := time.NewTicker(env.Heartbeat)
+		defer ticker.Stop()
 		for {
 			select {
-			case <-ticker.C:
-				heartbeat()
-			case <-n.keepaliveExit:
-				log.Println("Exit member node heartbeat ")
-				ticker.Stop()
+			case <-n.context().Done():
 				return
+			case <-ticker.C:
+				pool, err := n.rpcClient.getConnPoolContext(n.context(), n.AdvertiseAddr)
+				if err != nil {
+					log.Println(err)
+					continue
+				}
+				ctx, cancel := n.rpcContext(n.context())
+				_, err = clusterpb.NewMasterClient(pool.Get()).Heartbeat(ctx, &clusterpb.HeartbeatRequest{MemberInfo: n.memberInfo()})
+				cancel()
+				if err != nil {
+					log.Println("Heartbeat failed", err)
+				}
 			}
 		}
 	}()
+}
+
+func (n *Node) finalizeSession(s *session.Session) {
+	n.tasks.Add(1)
+	if err := scheduler.PushFinalizer(func() {
+		defer n.tasks.Done()
+		session.Lifetime.Close(s)
+	}); err != nil {
+		n.tasks.Done()
+		log.Println(err)
+	}
 }

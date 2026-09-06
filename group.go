@@ -175,6 +175,9 @@ func (c *Group) Add(session *session.Session) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if c.isClosed() {
+		return ErrClosedGroup
+	}
 	id := session.ID()
 	_, ok := c.sessions[session.ID()]
 	if ok {
@@ -232,6 +235,9 @@ func (c *Group) isClosed() bool {
 
 // Close destroy group, which will release all resource in the group
 func (c *Group) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if c.isClosed() {
 		return ErrCloseClosedGroup
 	}
